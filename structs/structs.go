@@ -1,0 +1,331 @@
+package structs
+
+import "encoding/json"
+
+// database types
+type DBAddProfileData struct {
+	Uri      string `json:"uri"`
+	GroupId  int    `json:"group_id"`
+	Name     string `json:"name"`
+	Protocol string `json:"protocol"`
+	Address  string `json:"address,omitzero"`
+	Host     string `json:"host,omitzero"`
+	NanoID   string `json:"nano-id,omitzero"`
+}
+
+// commands and responses
+type DeleteProfilesData struct {
+	Profiles []ProfileID `json:"profiles"`
+}
+
+type ProfilesDeleted struct {
+	DeletedProfiles []ProfileID `json:"deleted-profiles"`
+}
+
+type AddProfilesData struct {
+	Uris    string `json:"uris"`
+	GroupId int    `json:"group_id"`
+}
+
+type ProfilesAdded struct {
+	Profiles []Profile `json:"profiles"`
+}
+
+type AddGroupData struct {
+	Name            string `json:"name"`
+	SubscriptionUrl string `json:"subscription_url"`
+}
+
+type GroupAdded struct {
+	Id              int    `json:"id"`
+	SubscriptionUrl string `json:"subscription_url"`
+	Name            string `json:"name"`
+}
+
+type DeleteGroupData struct {
+	Id int `json:"id"`
+}
+
+type GroupDeleted struct {
+	Id int `json:"id"`
+}
+
+type ConnectData struct {
+	Profile ProfileID `json:"profile"`
+}
+
+type DisconnectData struct{}
+
+type TestProfileData struct {
+	Profile     ProfileID `json:"profile"`
+	Method      string    `json:"method"`
+	SampleCount int       `json:"sample_count,omitzero"`
+}
+
+type TestGroupData struct {
+	GroupId     int    `json:"group_id"`
+	Method      string `json:"method"`
+	SampleCount int    `json:"sample_count,omitzero"`
+}
+
+type CancelTestsData struct{}
+
+type TestConfig struct {
+	Concurrency    int    `json:"concurrency"`
+	TimeoutSeconds int    `json:"timeout_seconds"`
+	SamplesPerTest int    `json:"samples_per_test"`
+	TestEndpoint   string `json:"test_endpoint"`
+	AutoTestOnSub  bool   `json:"auto_test_on_subscribe"`
+}
+
+type SetTestConfigData struct {
+	Config TestConfig `json:"config"`
+}
+
+type TestConfigUpdated struct {
+	Config TestConfig `json:"config"`
+}
+
+type TestProgress struct {
+	GroupId int `json:"group_id,omitzero"`
+	Tested  int `json:"tested"`
+	Total   int `json:"total"`
+}
+
+type ProfileUpdated struct {
+	Profile Profile `json:"profile"`
+}
+
+type GetApplicationStateData struct{}
+
+type XrayStatusInfo struct {
+	Version         string `json:"version"`
+	TargetVersion   string `json:"target_version"`
+	Status          string `json:"status"`   // "ready", "downloading", "missing", "error"
+	Progress        int    `json:"progress"` // 0-100
+	BytesDownloaded int64  `json:"bytes_downloaded,omitzero"`
+	TotalBytes      int64  `json:"total_bytes,omitzero"`
+	Error           string `json:"error,omitzero"`
+}
+
+type XrayProgressNotification struct {
+	Status          string `json:"status"`
+	Version         string `json:"version"`
+	Progress        int    `json:"progress"`
+	BytesDownloaded int64  `json:"bytes_downloaded,omitzero"`
+	TotalBytes      int64  `json:"total_bytes,omitzero"`
+	Error           string `json:"error,omitzero"`
+}
+
+type ApplicationState struct {
+	Groups           []GroupWithProfiles `json:"groups"`
+	ConnectionStatus ProxyStatus         `json:"connection-status"`
+	TunStatus        bool                `json:"tun-status"`
+	HwidInfo         HwidData            `json:"hwid_info"`
+	KillSwitch       bool                `json:"kill_switch"`
+	SplitTunnel      string              `json:"split_tunnel"`
+	Autoconnect      AutoconnectInfo     `json:"autoconnect"`
+	XrayStatus       XrayStatusInfo      `json:"xray_status"`
+	CoreVersion      string              `json:"core_version,omitzero"`
+	ProtocolVersion  int                 `json:"protocol_version,omitzero"`
+}
+
+type UpdateSubscriptionData struct {
+	GroupId int `json:"group_id"`
+}
+
+type SubscriptionUpdated struct {
+	GroupId  int       `json:"group_id"`
+	Group    Group     `json:"group"`
+	Profiles []Profile `json:"profiles"`
+}
+
+type Warning struct {
+	Key     string `json:"key"`
+	Content string `json:"content"`
+}
+
+type DieData struct{}
+
+type IsRootData struct{}
+type IsRootAnswer struct {
+	IsRoot bool
+}
+
+type HwidData struct {
+	Enabled   bool   `json:"enabled"`
+	Hwid      string `json:"hwid"`
+	UserAgent string `json:"user_agent"`
+	Platform  string `json:"platform"`
+	Kernel    string `json:"kernel"`
+	Model     string `json:"model"`
+}
+
+type SetHwidData struct {
+	Enabled   *bool   `json:"enabled,omitempty"`
+	UserAgent *string `json:"user_agent,omitempty"`
+	Reset     bool    `json:"reset"`
+}
+
+type SetTunNameData struct {
+	TunName string `json:"tun_name"`
+}
+
+type UpdateProfileData struct {
+	Profile ProfileID
+	Name    string
+}
+
+type UpdateGroupData struct {
+	Id              int    `json:"id"`
+	Name            string `json:"name,omitzero"`
+	SubscriptionUrl string `json:"subscription_url,omitzero"`
+}
+
+type SetKillSwitchData struct {
+	Enabled bool `json:"enabled"`
+}
+
+type SetSplitTunnelData struct {
+	Mode string `json:"mode"`
+}
+
+type SetAutoconnectData struct {
+	Enabled   bool   `json:"enabled"`
+	GroupId   int    `json:"group_id"`
+	ProfileId int    `json:"profile_id"`
+	Mode      string `json:"mode"`
+}
+
+type AutoconnectInfo struct {
+	Enabled bool   `json:"enabled"`
+	Mode    string `json:"mode"`
+}
+
+type ReorderProfilesData struct {
+	GroupId    int   `json:"group_id"`
+	ProfileIds []int `json:"profile_ids"`
+}
+
+type ReorderGroupsData struct {
+	GroupIds []int `json:"group_ids"`
+}
+
+type MoveProfileData struct {
+	ProfileId   int `json:"profile_id"`
+	FromGroupId int `json:"from_group_id"`
+	ToGroupId   int `json:"to_group_id"`
+}
+
+type ProfilesReordered struct {
+	GroupId    int   `json:"group_id"`
+	ProfileIds []int `json:"profile_ids"`
+}
+
+type GroupsReordered struct {
+	GroupIds []int `json:"group_ids"`
+}
+
+type ProfileMoved struct {
+	OldProfile ProfileID `json:"old_profile"`
+	NewProfile Profile   `json:"new_profile"`
+}
+
+// general types
+type DBConfig struct {
+	LastGroupId int   `json:"last_group_id"`
+	GroupOrder  []int `json:"group_order,omitempty"`
+}
+
+type GroupWithProfiles struct {
+	Group    Group     `json:"group"`
+	Profiles []Profile `json:"profiles"`
+}
+
+type Group struct {
+	Id              int    `json:"id"`
+	SubscriptionUrl string `json:"subscription_url"`
+	Name            string `json:"name"`
+	LastId          int    `json:"last_id"`
+	SubLastUpdated  int64  `json:"sub_last_updated,omitzero"`
+	SubExpires      int64  `json:"sub_expires,omitzero"`
+	SubUpload       int64  `json:"sub_upload,omitzero"`
+	SubDownload     int64  `json:"sub_download,omitzero"`
+	SubTotal        int64  `json:"sub_total,omitzero"`
+	ProfileOrder    []int  `json:"profile_order,omitempty"`
+}
+
+type Profile struct {
+	Id         int    `json:"id"`
+	GroupId    int    `json:"group_id"`
+	NanoID     string `json:"nano-id,omitzero"`
+	Name       string `json:"name"`
+	Protocol   string `json:"protocol"`
+	Uri        string `json:"uri"`
+	Address    string `json:"address,omitzero"`
+	Host       string `json:"host,omitzero"`
+	TestResult int    `json:"test-result"`
+	TestedAt   int64  `json:"tested_at,omitzero"`
+	LossPct    int    `json:"loss-pct,omitzero"`
+	JitterMs   int    `json:"jitter-ms,omitzero"`
+}
+
+type ProfileID struct {
+	Id      int `json:"id"`
+	GroupId int `json:"group_id"`
+}
+
+type TCPMessage struct {
+	Msg  string          `json:"msg"`
+	Data json.RawMessage `json:"data"`
+}
+
+type Message[T any] struct {
+	Msg  string `json:"msg"`
+	Data T      `json:"data"`
+}
+
+type ProxyStatus struct {
+	Connection  string  `json:"connection"`
+	Profile     Profile `json:"profile"`
+	ConnectedAt int64   `json:"connected_at"`
+}
+
+type DisableTunData struct{}
+type EnableTunData struct{}
+
+type TunStatus struct {
+	IsEnabled bool `json:"is_enabled"`
+}
+
+type TrafficStats struct {
+	ProxyUp    int64 `json:"proxy_up"`
+	ProxyDown  int64 `json:"proxy_down"`
+	DirectUp   int64 `json:"direct_up"`
+	DirectDown int64 `json:"direct_down"`
+}
+
+// routing types
+type RoutingRule struct {
+	Type        string `json:"type"`
+	Domain      string `json:"domain,omitzero"`
+	IP          string `json:"ip,omitzero"`
+	Protocol    string `json:"protocol,omitzero"`
+	Port        string `json:"port,omitzero"`
+	OutboundTag string `json:"outbound_tag"`
+	Enabled     bool   `json:"enabled"`
+}
+
+type RoutingConfig struct {
+	DomainStrategy string        `json:"domain_strategy"`
+	Rules          []RoutingRule `json:"rules"`
+}
+
+type GetRoutingData struct{}
+type UpdateRoutingData struct {
+	Config RoutingConfig `json:"config"`
+}
+
+type RoutingUpdated struct {
+	Config RoutingConfig `json:"config"`
+}

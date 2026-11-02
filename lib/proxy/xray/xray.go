@@ -1,0 +1,172 @@
+package xray
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"sync"
+	"syscall"
+	"time"
+	"whoisthat-core/lib/geo"
+	"whoisthat-core/lib/logger"
+	"whoisthat-core/lib/xraymgr"
+	"whoisthat-core/utils"
+
+	"golang.org/x/sys/unix"
+)
+
+type XrayCore struct {
+	mu             sync.Mutex
+	cmd            *exec.Cmd
+	cancel         context.CancelFunc
+	running        bool
+	channel_closed bool
+	Exited         chan error
+}
+
+// ExitedCh returns the channel used to report subprocess termination. Lets
+// mainproxy treat both xray.XrayCore and hysteria.HysteriaCore through a
+// common interface.
+func (x *XrayCore) ExitedCh() chan error {
+	return x.Exited
+}
+
+func (x *XrayCore) Start(stdinPipe []byte) error {
+	x.mu.Lock()
+	defer x.mu.Unlock()
+
+	if x.running {
+		return fmt.Errorf("command is already running")
+	}
+
+	if x.Exited == nil || x.channel_closed {
+		x.Exited = make(chan error, 1)
+		x.channel_closed = false
+	}
+
+	xraybin, err := xraymgr.GetManager().GetXrayBin()
+	if err != nil {
+		return fmt.Errorf("failed to start xray: %w", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cmd := exec.CommandContext(ctx, xraybin, "run")
+	stdin, err := cmd.StdinPipe()
+
+	if err != nil {
+		cancel()
+		return fmt.Errorf("failed to get stdin %w", err)
+	}
+
+	cmd.Stdout = nil
+	xrayLog, err := os.CreateTemp("", "whoisthat-xray-*.log")
+	if err == nil {
+		cmd.Stderr = xrayLog
+		logger.Infof("xray stderr -> %s", xrayLog.Name())
+	} else {
+		xrayLog = nil
+		cmd.Stderr = nil
+	}
+
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		AmbientCaps: []uintptr{unix.CAP_NET_ADMIN, unix.CAP_NET_RAW},
+	}
+
+	if uid := utils.DedicatedUid(); uid > 0 {
+		gid := utils.DedicatedGid()
+		if gid == 0 {
+			gid = uid
+		}
+		cmd.SysProcAttr.Credential = &syscall.Credential{
+			Uid: uint32(uid),
+			Gid: uint32(gid),
+		}
+		logger.Infof("xray will run as uid=%d gid=%d", uid, gid)
+	}
+
+	if ad := geo.AssetDir(); ad != "" {
+		geo.WaitReady(3 * time.Second)
+		if geo.IsReady() {
+			cmd.Env = append(os.Environ(), "XRAY_LOCATION_ASSET="+ad)
+			logger.Infof("xray XRAY_LOCATION_ASSET=%s", ad)
+		} else if _, err := os.Stat(filepath.Join(ad, "geoip.dat")); err == nil {
+			cmd.Env = append(os.Environ(), "XRAY_LOCATION_ASSET="+ad)
+			logger.Infof("xray XRAY_LOCATION_ASSET=%s (fallback: files exist)", ad)
+		} else {
+			logger.Warn("xray: geo assets not ready, skipping XRAY_LOCATION_ASSET")
+		}
+	}
+
+	if err := cmd.Start(); err != nil {
+		cancel()
+		return err
+	}
+
+	logger.Infof("xray started (pid=%d)", cmd.Process.Pid)
+
+	go func() {
+		defer stdin.Close()
+		_, _ = stdin.Write(stdinPipe)
+	}()
+
+	x.cmd = cmd
+	x.cancel = cancel
+	x.running = true
+
+	go func() {
+		err := cmd.Wait()
+		logger.Infof("xray stopped (pid=%d)", cmd.Process.Pid)
+		// Keep the stderr log when the process exited with an error so
+		// failures are diagnosable (e.g. hysteria2 protocol fed to xray
+		// by mistake — its config-rejection error lives in this log).
+		// Clean exit (err == nil and ctx not cancelled) frees the temp log.
+		if xrayLog != nil && err == nil && ctx.Err() == nil {
+			_ = os.Remove(xrayLog.Name())
+		} else if xrayLog != nil {
+			logger.Warnf("xray exited with error; stderr retained at %s (err=%v)", xrayLog.Name(), err)
+		}
+		x.mu.Lock()
+		defer x.mu.Unlock()
+		if ctx.Err() == nil {
+			x.running = false
+			if !x.channel_closed {
+				select {
+				case x.Exited <- err:
+				default:
+				}
+				close(x.Exited)
+				x.channel_closed = true
+			}
+		}
+
+	}()
+
+	return nil
+}
+
+func (x *XrayCore) Stop() {
+	x.mu.Lock()
+	defer x.mu.Unlock()
+	if !x.channel_closed {
+		close(x.Exited)
+		x.channel_closed = true
+	}
+	if x.cmd != nil && x.cmd.Process != nil {
+		err := x.cmd.Process.Kill()
+		if err != nil {
+			logger.Warn("error killing xray process:", err)
+		}
+	}
+	if x.cancel != nil {
+		x.cancel()
+	}
+	x.running = false
+}
+
+func (x *XrayCore) IsRunning() bool {
+	x.mu.Lock()
+	defer x.mu.Unlock()
+	return x.running
+}
