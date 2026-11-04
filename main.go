@@ -27,12 +27,38 @@ import (
 	"whoisthat-core/utils"
 )
 
+const usage = "Usage: whoisthat-core\n\nRuns in the foreground and serves the TUI/CLI over IPC.\n"
+
+// versionLine is a stable contract: install.sh and release.yml parse it.
+func versionLine() string {
+	return fmt.Sprintf("whoisthat-core v%s (protocol %d)\n", version.CoreVersion, version.ProtocolVersion)
+}
+
+// handleArgs reports whether the process should exit before starting the daemon.
+func handleArgs(args []string) (code int, done bool) {
+	if len(args) == 0 {
+		return 0, false
+	}
+	switch args[0] {
+	case "--version", "-v", "version":
+		fmt.Print(versionLine())
+		return 0, true
+	case "--help", "-h":
+		fmt.Print(usage)
+		return 0, true
+	default:
+		fmt.Fprintf(os.Stderr, "whoisthat-core: unknown argument %q (run with --help)\n", args[0])
+		return 2, true
+	}
+}
+
+// testMode keeps the daemon away from the network and the global firewall so
+// the IPC smoke test can run it in a sandbox (see scripts/ipc-e2e.test.sh).
+func testMode() bool { return os.Getenv("WHOISTHAT_TEST_MODE") == "1" }
+
 func main() {
-	for _, arg := range os.Args[1:] {
-		if arg == "--version" || arg == "-v" || arg == "version" || arg == "--help" || arg == "-h" {
-			fmt.Printf("whoisthat-core v%s (protocol %d)\n", version.CoreVersion, version.ProtocolVersion)
-			return
-		}
+	if code, done := handleArgs(os.Args[1:]); done {
+		os.Exit(code)
 	}
 	configDir := utils.ConfigDir()
 	logPath := coreLogPath(configDir)
@@ -83,7 +109,7 @@ func main() {
 	// firewall/routing rules from a previous core that exited without cleaning
 	// up (hard quit, crash, power loss mid-TUN). Guarded on the IPC endpoint
 	// being free so we never nuke a live core's rules.
-	if !coreAlreadyRunning() {
+	if !testMode() && !coreAlreadyRunning() {
 		if err := tunmode.ReconcileOrphanedRules(appconfig.GetConfig().TunName); err != nil {
 			logger.Warnf("startup reconcile: %v", err)
 		} else {
@@ -91,9 +117,11 @@ func main() {
 		}
 	}
 
-	geoDir := filepath.Join(configDir, "geo")
-	if _, err := geo.EnsureAssets(geoDir); err != nil {
-		logger.Warnf("main: geo assets not available: %v", err)
+	if !testMode() {
+		geoDir := filepath.Join(configDir, "geo")
+		if _, err := geo.EnsureAssets(geoDir); err != nil {
+			logger.Warnf("main: geo assets not available: %v", err)
+		}
 	}
 	database := db.DB{}
 	database.Initialize()
@@ -120,7 +148,7 @@ func main() {
 	if err := xm.Init(); err != nil {
 		logger.Warnf("main: xraymgr init: %v", err)
 	}
-	if xm.GetStatus().Status != "ready" {
+	if !testMode() && xm.GetStatus().Status != "ready" {
 		logger.Infof("main: xray status is %s, ensuring runtime in background", xm.GetStatus().Status)
 		xm.EnsureRuntimeAsync()
 	}
@@ -136,13 +164,15 @@ func main() {
 	server := TCPServer.NewServer(&database, &proxy_manager, &tun_manager, stop_sig, missing)
 	server.Start()
 
-	go func() {
-		// Auto-update first probes all unknown intervals. Waiting for
-		// autoconnect means the VPN is up before any subscription traffic.
-		bootAutoconnect(&database, &proxy_manager, &tun_manager, server)
-		autoCmd := cmd.Cmd{DB: &database, Broadcast: server.Broadcast, TunManager: &tun_manager}
-		autoCmd.AutoUpdateLoop(&proxy_manager)
-	}()
+	if !testMode() {
+		go func() {
+			// Auto-update first probes all unknown intervals. Waiting for
+			// autoconnect means the VPN is up before any subscription traffic.
+			bootAutoconnect(&database, &proxy_manager, &tun_manager, server)
+			autoCmd := cmd.Cmd{DB: &database, Broadcast: server.Broadcast, TunManager: &tun_manager}
+			autoCmd.AutoUpdateLoop(&proxy_manager)
+		}()
+	}
 
 	go func() {
 		sigs := make(chan os.Signal, 1)
@@ -162,7 +192,11 @@ func main() {
 		// next launch will tear down any leftover rules.
 		done := make(chan struct{})
 		go func() {
-			tunmode.RemoveKillSwitchBlock()
+			// The kill-switch table is global: in test mode it may belong to
+			// the user's live session, so only the real daemon tears it down.
+			if !testMode() {
+				tunmode.RemoveKillSwitchBlock()
+			}
 			proxy_manager.Stop()
 			tun_manager.Stop()
 			os.Remove(appconfig.SocketPath())
