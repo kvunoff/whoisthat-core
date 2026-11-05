@@ -54,7 +54,7 @@ func handleArgs(args []string) (code int, done bool) {
 
 // testMode keeps the daemon away from the network and the global firewall so
 // the IPC smoke test can run it in a sandbox (see scripts/ipc-e2e.test.sh).
-func testMode() bool { return os.Getenv("WHOISTHAT_TEST_MODE") == "1" }
+func testMode() bool { return utils.TestMode() }
 
 func main() {
 	if code, done := handleArgs(os.Args[1:]); done {
@@ -115,6 +115,16 @@ func main() {
 		} else {
 			logger.Info("startup reconcile: orphaned rules cleared")
 		}
+		// Reconcile removes the kill-switch table; if the user asked for it,
+		// re-arm immediately so a restart never silently exposes the machine.
+		if appconfig.GetConfig().KillSwitchEnabled {
+			cfg := appconfig.GetConfig()
+			if err := tunmode.SetupKillSwitchBlock(nil, cfg.TunName, cfg.DnsServers); err != nil {
+				logger.Warnf("kill-switch: failed to re-arm on startup: %v", err)
+			} else {
+				logger.Info("kill-switch: block re-armed on startup")
+			}
+		}
 	}
 
 	if !testMode() {
@@ -130,6 +140,23 @@ func main() {
 	proxy_manager := proxy.ProxyManager{}
 	proxy_manager.DB = &database
 	proxy_manager.Init()
+	// Install the kill-switch allowlist with the exact IPs Xray is about to
+	// use, right before it starts. This keeps the block armed for the whole
+	// connect instead of opening a leak window.
+	proxy_manager.SetPreStartHandler(func(ips []string) error {
+		if testMode() || !appconfig.GetConfig().KillSwitchEnabled {
+			return nil
+		}
+		if len(ips) == 0 {
+			return fmt.Errorf("%w: server IP unknown", proxy.ErrKillSwitchNotArmed)
+		}
+		cfg := appconfig.GetConfig()
+		if err := tunmode.SetupKillSwitchBlock(ips, cfg.TunName, cfg.DnsServers); err != nil {
+			return fmt.Errorf("%w: %v", proxy.ErrKillSwitchNotArmed, err)
+		}
+		logger.Infof("kill-switch: allowlist applied before start, %d IPs", len(ips))
+		return nil
+	})
 	// Seed the live test config from the persisted AppConfig so user
 	// customizations (samples/concurrency/endpoint/timeout) made in the
 	// TUI's Settings tab survive core restarts.
@@ -192,11 +219,9 @@ func main() {
 		// next launch will tear down any leftover rules.
 		done := make(chan struct{})
 		go func() {
-			// The kill-switch table is global: in test mode it may belong to
-			// the user's live session, so only the real daemon tears it down.
-			if !testMode() {
-				tunmode.RemoveKillSwitchBlock()
-			}
+			// The kill-switch block is deliberately not removed here: when it
+			// is enabled it must survive a stopped daemon. It is removed only
+			// by an explicit kill-switch=false or the startup reconcile.
 			proxy_manager.Stop()
 			tun_manager.Stop()
 			os.Remove(appconfig.SocketPath())

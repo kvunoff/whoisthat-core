@@ -1,6 +1,7 @@
 package tunmode
 
 import (
+	"fmt"
 	"os/exec"
 	"strings"
 	"testing"
@@ -14,7 +15,10 @@ func TestKillSwitchNftWhitelistsEverythingDocumented(t *testing.T) {
 	)
 
 	mustContain := []string{
-		"nft delete table inet whoisthat_ks",
+		"nft list chain inet whoisthat_ks output",
+		"policy drop",
+		"nft -f - <<'WHOISTHAT_KS_EOF'",
+		"flush chain inet whoisthat_ks output",
 		"oif lo accept",
 		"ip daddr 127.0.0.0/8 accept",
 		"ip daddr 10.0.0.0/8 accept",
@@ -42,8 +46,27 @@ func TestKillSwitchNftWhitelistsEverythingDocumented(t *testing.T) {
 		}
 	}
 
-	if !strings.HasSuffix(strings.TrimSpace(script), "nft add rule inet whoisthat_ks output drop") {
-		t.Errorf("nft script must end with the drop rule, got:\n%s", script)
+	if !strings.HasSuffix(strings.TrimSpace(script), "add rule inet whoisthat_ks output drop\nWHOISTHAT_KS_EOF") {
+		t.Errorf("nft script must end with the drop rule inside the batch, got:\n%s", script)
+	}
+}
+
+// The allowlist must be applied in one transaction: a partial batch would
+// otherwise leave the chain flushes but incomplete.
+func TestKillSwitchNftScriptIsAtomic(t *testing.T) {
+	script := buildKillSwitchNftScript(
+		[]string{"203.0.113.7"},
+		"whoisthattun",
+		[]string{"1.1.1.1"},
+	)
+	if got := strings.Count(script, "nft -f -"); got != 1 {
+		t.Fatalf("expected exactly one nft -f batch, got %d:\n%s", got, script)
+	}
+	if got := strings.Count(script, "flush chain inet whoisthat_ks output"); got != 1 {
+		t.Fatalf("expected exactly one flush, got %d:\n%s", got, script)
+	}
+	if strings.Contains(script, "nft add rule") {
+		t.Fatalf("allowlist rules must be inside the batch, got:\n%s", script)
 	}
 }
 
@@ -56,6 +79,7 @@ func TestKillSwitchIptablesWhitelistsEverythingDocumented(t *testing.T) {
 
 	mustContain := []string{
 		"iptables -N WHOISTHAT_KS",
+		"iptables -I OUTPUT 1 -j WHOISTHAT_KS",
 		"iptables -A WHOISTHAT_KS -o lo -j ACCEPT",
 		"iptables -A WHOISTHAT_KS -d 10.0.0.0/8 -j ACCEPT",
 		"iptables -A WHOISTHAT_KS -d 192.168.0.0/16 -j ACCEPT",
@@ -72,6 +96,17 @@ func TestKillSwitchIptablesWhitelistsEverythingDocumented(t *testing.T) {
 	for _, want := range mustContain {
 		if !strings.Contains(script, want) {
 			t.Errorf("iptables script missing %q\n---\n%s", want, script)
+		}
+	}
+
+	// Duplicate jumps from an older session must be removed before recreating
+	// the chain, otherwise -X fails and -N aborts under set -e.
+	for _, want := range []string{
+		`while "$IPT" -C OUTPUT -j WHOISTHAT_KS`,
+		"iptables -N WHOISTHAT_KS 2>/dev/null || iptables -F WHOISTHAT_KS",
+	} {
+		if !strings.Contains(script, want) {
+			t.Errorf("iptables script missing %q:\n%s", want, script)
 		}
 	}
 
@@ -204,7 +239,156 @@ func TestKillSwitchNftWithoutProxyIPsStillFailsClosed(t *testing.T) {
 			t.Errorf("nft script missing %q\n---\n%s", want, script)
 		}
 	}
-	if !strings.HasSuffix(strings.TrimSpace(script), "nft add rule inet whoisthat_ks output drop") {
+	if !strings.HasSuffix(strings.TrimSpace(script), "add rule inet whoisthat_ks output drop\nWHOISTHAT_KS_EOF") {
 		t.Errorf("nft script must still end with the drop rule:\n%s", script)
+	}
+}
+
+// fakeProbes swaps the inspection seams so exit-code handling can be tested
+// without real capabilities or a live firewall.
+func fakeProbes(t *testing.T, available map[string]bool, run func(string, ...string) (string, error)) {
+	t.Helper()
+	oldLook, oldRun, oldScript := killSwitchLookPath, killSwitchRun, killSwitchRunScript
+	killSwitchLookPath = func(name string) (string, error) {
+		if available[name] {
+			return "/usr/bin/" + name, nil
+		}
+		return "", &exec.Error{Name: name, Err: exec.ErrNotFound}
+	}
+	killSwitchRun = run
+	killSwitchRunScript = func(string) (string, error) { return "", nil }
+	t.Cleanup(func() {
+		killSwitchLookPath, killSwitchRun, killSwitchRunScript = oldLook, oldRun, oldScript
+	})
+}
+
+func exitCodeErr(code int) error {
+	return exec.Command("sh", "-c", fmt.Sprintf("exit %d", code)).Run()
+}
+
+func TestKillSwitchArmedSkipsAbsentBackends(t *testing.T) {
+	fakeProbes(t, nil, func(string, ...string) (string, error) {
+		t.Fatal("must not run a missing binary")
+		return "", nil
+	})
+	armed, err := KillSwitchArmed()
+	if armed || err != nil {
+		t.Fatalf("KillSwitchArmed() = %v, %v; want false, nil", armed, err)
+	}
+}
+
+func TestKillSwitchArmedDetectsNftChain(t *testing.T) {
+	fakeProbes(t, map[string]bool{"nft": true}, func(string, ...string) (string, error) {
+		return "", nil
+	})
+	armed, err := KillSwitchArmed()
+	if !armed || err != nil {
+		t.Fatalf("KillSwitchArmed() = %v, %v; want true, nil", armed, err)
+	}
+}
+
+func TestKillSwitchArmedDistinguishesMissingTableFromFailure(t *testing.T) {
+	cases := []struct {
+		name    string
+		out     string
+		err     error
+		want    bool
+		wantErr bool
+	}{
+		{"missing table", "Error: Could not process rule: No such file or directory", exitCodeErr(1), false, false},
+		{"permission denied", "Error: Could not process rule: Operation not permitted", exitCodeErr(1), false, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fakeProbes(t, map[string]bool{"nft": true}, func(string, ...string) (string, error) {
+				return tc.out, tc.err
+			})
+			armed, err := KillSwitchArmed()
+			if armed != tc.want || (err != nil) != tc.wantErr {
+				t.Fatalf("KillSwitchArmed() = %v, %v; want %v, err=%v", armed, err, tc.want, tc.wantErr)
+			}
+		})
+	}
+}
+
+func TestKillSwitchArmedIptablesExitCodes(t *testing.T) {
+	cases := []struct {
+		code    int
+		want    bool
+		wantErr bool
+	}{
+		{0, true, false},  // rule present
+		{1, false, false}, // rule missing
+		{2, false, false}, // chain missing
+		{4, false, true},  // permission denied: must not look disarmed
+	}
+	for _, tc := range cases {
+		t.Run(fmt.Sprintf("exit_%d", tc.code), func(t *testing.T) {
+			fakeProbes(t, map[string]bool{"iptables": true, "ip6tables": true}, func(name string, args ...string) (string, error) {
+				if name == "nft" {
+					t.Fatalf("nft must be skipped when absent")
+				}
+				return "", exitCodeErr(tc.code)
+			})
+			armed, err := KillSwitchArmed()
+			if armed != tc.want || (err != nil) != tc.wantErr {
+				t.Fatalf("KillSwitchArmed() = %v, %v; want %v, err=%v", armed, err, tc.want, tc.wantErr)
+			}
+		})
+	}
+}
+
+func TestKillSwitchArmedDetectsLeftoverIPv6Chain(t *testing.T) {
+	fakeProbes(t, map[string]bool{"iptables": true, "ip6tables": true}, func(name string, args ...string) (string, error) {
+		if name == "ip6tables" {
+			return "", nil
+		}
+		return "", exitCodeErr(1)
+	})
+	armed, err := KillSwitchArmed()
+	if !armed || err != nil {
+		t.Fatalf("KillSwitchArmed() = %v, %v; want true, nil", armed, err)
+	}
+}
+
+func TestRemoveKillSwitchBlockRefusesWhileArmed(t *testing.T) {
+	fakeProbes(t, map[string]bool{"iptables": true, "ip6tables": true}, func(string, ...string) (string, error) {
+		return "", nil // exit 0: still armed
+	})
+	if err := RemoveKillSwitchBlock(); err == nil {
+		t.Fatal("RemoveKillSwitchBlock() = nil; want an error while rules remain")
+	}
+}
+
+func TestRemoveKillSwitchBlockReportsProbeFailure(t *testing.T) {
+	fakeProbes(t, map[string]bool{"iptables": true, "ip6tables": true}, func(string, ...string) (string, error) {
+		return "", exitCodeErr(4) // permission denied
+	})
+	if err := RemoveKillSwitchBlock(); err == nil {
+		t.Fatal("RemoveKillSwitchBlock() = nil; want an error when the state cannot be verified")
+	}
+}
+
+func TestRemoveKillSwitchBlockSucceedsWhenGone(t *testing.T) {
+	fakeProbes(t, map[string]bool{"iptables": true, "ip6tables": true}, func(string, ...string) (string, error) {
+		return "", exitCodeErr(1)
+	})
+	if err := RemoveKillSwitchBlock(); err != nil {
+		t.Fatalf("RemoveKillSwitchBlock() = %v; want nil", err)
+	}
+}
+
+func TestKillSwitchIptablesTeardownRemovesDuplicateJumps(t *testing.T) {
+	script := buildKillSwitchIptablesTeardownScript()
+	for _, want := range []string{
+		"for IPT in iptables ip6tables",
+		`while "$IPT" -C OUTPUT -j WHOISTHAT_KS`,
+		`"$IPT" -D OUTPUT -j WHOISTHAT_KS`,
+		`"$IPT" -F WHOISTHAT_KS`,
+		`"$IPT" -X WHOISTHAT_KS`,
+	} {
+		if !strings.Contains(script, want) {
+			t.Errorf("teardown script missing %q:\n%s", want, script)
+		}
 	}
 }

@@ -3,13 +3,17 @@
 package tunmode
 
 import (
+	"net"
 	"os"
 	"os/exec"
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	"golang.org/x/sys/unix"
+
+	"whoisthat-core/lib/netmark"
 )
 
 // These tests exercise the real ip/nftables/sysctl commands in a throwaway
@@ -132,5 +136,114 @@ func TestNetnsRpFilterRestored(t *testing.T) {
 	restored, _ := os.ReadFile("/proc/sys/net/ipv4/conf/" + tun + "/rp_filter")
 	if strings.TrimSpace(string(restored)) != original {
 		t.Errorf("rp_filter restored to %q, want %q", strings.TrimSpace(string(restored)), original)
+	}
+}
+
+func countDropRules(t *testing.T, rules string) int {
+	t.Helper()
+	count := 0
+	for _, line := range strings.Split(rules, "\n") {
+		if strings.TrimSpace(line) == "drop" {
+			count++
+		}
+	}
+	return count
+}
+
+func TestNetnsKillSwitchArmTwiceIsIdempotent(t *testing.T) {
+	enterTestNetns(t)
+
+	for i := 0; i < 2; i++ {
+		if err := SetupKillSwitchBlock([]string{"192.0.2.10"}, "wittest0", []string{"1.1.1.1"}); err != nil {
+			t.Fatalf("SetupKillSwitchBlock (attempt %d): %v", i+1, err)
+		}
+	}
+
+	out, err := runScriptWithSh("nft list chain inet whoisthat_ks output")
+	if err != nil {
+		t.Fatalf("listing the chain: %v", err)
+	}
+	if got := countDropRules(t, out); got != 1 {
+		t.Errorf("drop rules = %d, want 1:\n%s", got, out)
+	}
+	if got := strings.Count(out, "192.0.2.10"); got != 1 {
+		t.Errorf("proxy IP appears %d times, want 1:\n%s", got, out)
+	}
+}
+
+// An interrupted install could leave a table without its chain; the bootstrap
+// must repair it instead of skipping and failing to flush a missing chain.
+func TestNetnsKillSwitchRepairsTableWithoutChain(t *testing.T) {
+	enterTestNetns(t)
+
+	if _, err := runScriptWithSh("nft add table inet whoisthat_ks"); err != nil {
+		t.Fatalf("seed empty table: %v", err)
+	}
+	if err := SetupKillSwitchBlock(nil, "wittest0", []string{"1.1.1.1"}); err != nil {
+		t.Fatalf("SetupKillSwitchBlock over a chain-less table: %v", err)
+	}
+
+	out, err := runScriptWithSh("nft list chain inet whoisthat_ks output")
+	if err != nil {
+		t.Fatalf("listing the chain: %v", err)
+	}
+	if got := countDropRules(t, out); got != 1 {
+		t.Errorf("drop rules = %d, want 1:\n%s", got, out)
+	}
+}
+
+func TestNetnsKillSwitchArmedProbeAndRemove(t *testing.T) {
+	enterTestNetns(t)
+
+	if armed, err := KillSwitchArmed(); armed || err != nil {
+		t.Fatalf("KillSwitchArmed() before arming = %v, %v; want false, nil", armed, err)
+	}
+	if err := SetupKillSwitchBlock([]string{"192.0.2.10"}, "wittest0", []string{"1.1.1.1"}); err != nil {
+		t.Fatalf("SetupKillSwitchBlock: %v", err)
+	}
+	if armed, err := KillSwitchArmed(); !armed || err != nil {
+		t.Fatalf("KillSwitchArmed() after arming = %v, %v; want true, nil", armed, err)
+	}
+	if err := RemoveKillSwitchBlock(); err != nil {
+		t.Fatalf("RemoveKillSwitchBlock: %v", err)
+	}
+	if armed, err := KillSwitchArmed(); armed || err != nil {
+		t.Fatalf("KillSwitchArmed() after removal = %v, %v; want false, nil", armed, err)
+	}
+}
+
+// The daemon's own downloads (geo, runtime, subscriptions) must keep working
+// while the block is armed; they rely on SO_MARK=DirectMark.
+func TestNetnsNetmarkSetsDirectMark(t *testing.T) {
+	enterTestNetns(t)
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer listener.Close()
+
+	conn, err := netmark.Dialer(time.Second).Dial("tcp", listener.Addr().String())
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+
+	tcp, ok := conn.(*net.TCPConn)
+	if !ok {
+		t.Fatalf("connection is %T, want *net.TCPConn", conn)
+	}
+	raw, err := tcp.SyscallConn()
+	if err != nil {
+		t.Fatalf("SyscallConn: %v", err)
+	}
+	var mark int
+	if err := raw.Control(func(fd uintptr) {
+		mark, _ = unix.GetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_MARK)
+	}); err != nil {
+		t.Fatalf("control: %v", err)
+	}
+	if mark != netmark.DirectMark {
+		t.Fatalf("SO_MARK = %d, want %d", mark, netmark.DirectMark)
 	}
 }
