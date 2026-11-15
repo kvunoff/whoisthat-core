@@ -65,13 +65,15 @@ func main() {
 	configDir := utils.ConfigDir()
 	logPath := coreLogPath(configDir)
 
-	log.SetOutput(&lumberjack.Logger{
-		Filename:   logPath,
-		MaxSize:    20,
-		MaxBackups: 2,
-		MaxAge:     0,
-		Compress:   false,
-	})
+	if logPath != "" {
+		log.SetOutput(&lumberjack.Logger{
+			Filename:   logPath,
+			MaxSize:    20,
+			MaxBackups: 2,
+			MaxAge:     0,
+			Compress:   false,
+		})
+	}
 
 	log.SetFlags(log.LstdFlags)
 	logger.SetLevel(os.Getenv("WHOISTHAT_LOG_LEVEL"))
@@ -83,17 +85,43 @@ func main() {
 	)
 	setupCrashLog()
 
-	// A second daemon must not race the first one for the IPC socket, the TUN
-	// device and the firewall. The lock is held until the process exits.
-	// Config is loaded first so the lock probe knows about an ipc-socket-path
-	// override from config.json.
+	// Only the uid authorized by the root-written allowlist may run a core with
+	// network capabilities. The check is deliberately outside testMode(): a
+	// test-mode environment variable must not become a bypass.
+	if err := utils.CheckAuthorization(); err != nil {
+		logger.Errorf("whoisthat-core: %v", err)
+		fmt.Fprintln(os.Stderr, "whoisthat-core:", err)
+		os.Exit(78) // EX_CONFIG
+	}
+	// One core owns the host-wide netns state. The lock is held until the
+	// process exits; a missing lock file is fatal only when we hold
+	// capabilities (a capless dev/proxy core cannot change global state).
+	lock, err := utils.AcquireGlobalLock()
+	if err != nil {
+		logger.Errorf("whoisthat-core: %v", err)
+		fmt.Fprintln(os.Stderr, "whoisthat-core:", err)
+		os.Exit(78)
+	}
+	globalCoreLock = lock
+
+	if err := utils.ValidateRuntime(); err != nil {
+		logger.Errorf("whoisthat-core: %v", err)
+		fmt.Fprintln(os.Stderr, "whoisthat-core:", err)
+		os.Exit(78)
+	}
+
+	// A second daemon of the same uid must not race the first one for the IPC
+	// socket, the TUN device and the firewall. The lock is held until the
+	// process exits. Config is loaded first so the lock probe knows about an
+	// ipc-socket-path override from config.json.
 	appconfig.LoadConfig()
 	held, lock_dir, err := acquireInstanceLock()
 	if err != nil {
-		// The runtime dir may be unavailable; the socket probe below still
-		// keeps us from stealing a live core's socket.
-		logger.Warnf("instance lock unavailable: %v", err)
-	} else if !held {
+		logger.Errorf("whoisthat-core: instance lock unavailable: %v", err)
+		fmt.Fprintln(os.Stderr, "whoisthat-core: instance lock unavailable:", err)
+		os.Exit(78)
+	}
+	if !held {
 		logger.Infof("another whoisthat-core is already running (lock: %s); exiting", lock_dir)
 		return // exit 0: a non-zero code would loop under systemd Restart=on-failure
 	}
@@ -109,16 +137,15 @@ func main() {
 		return
 	}
 
-	// One core per network namespace: the TUN name and nft table are global.
-	// The marker is root-created (best effort); when present it names the uid
-	// that owns the rules, so a second user must not reconcile them away.
-	if !testMode() {
-		uid := runtimeUid()
-		if err := checkActiveUser(uid); err != nil {
-			logger.Error("refusing to start:", err)
-			return
+	// Cores from older builds do not take the global lock. Refuse to run next
+	// to one so the startup reconcile cannot tear down rules that it owns.
+	if !testMode() && utils.HasNetAdmin() {
+		if uid, pid := utils.OtherCoreRunning(); pid > 0 {
+			msg := fmt.Sprintf("an older whoisthat-core is running (uid %d, pid %d); stop it first", uid, pid)
+			logger.Error(msg)
+			fmt.Fprintln(os.Stderr, "whoisthat-core:", msg)
+			os.Exit(78)
 		}
-		claimActiveUser(uid)
 	}
 
 	// Self-heal: if no other core is already listening, tear down any leftover
@@ -250,15 +277,17 @@ func main() {
 			logger.Warn("shutdown: cleanup timed out after 10s, exiting anyway")
 			os.Remove(appconfig.SocketPath())
 		}
-		releaseActiveUser()
 		os.Exit(0)
 	}()
 	select {}
 }
 
-// instanceLock stays open for the lifetime of the process. Closing it (or
-// exiting) releases the flock so the next core can start.
-var instanceLock *os.File
+// instanceLock and globalCoreLock stay open for the lifetime of the process.
+// Closing them (or exiting) releases the flocks so the next core can start.
+var (
+	instanceLock   *os.File
+	globalCoreLock *os.File
+)
 
 // acquireInstanceLock tries the primary runtime dir and also checks the known
 // fallback locations for a lock held by an older/newer core. It returns
@@ -280,7 +309,7 @@ func acquireInstanceLock() (bool, string, error) {
 			return false, other, nil
 		}
 	}
-	if err := os.MkdirAll(dir, 0700); err != nil {
+	if err := utils.EnsurePrivateDir(dir, os.Getuid()); err != nil {
 		return false, dir, err
 	}
 	f, err := os.OpenFile(filepath.Join(dir, "core.lock"), os.O_CREATE|os.O_RDWR, 0600)
@@ -301,8 +330,11 @@ func acquireInstanceLock() (bool, string, error) {
 // lockHeld reports whether another process holds core.lock in dir. Stale lock
 // files are not an obstacle: only an actual flock counts.
 func lockHeld(dir string) (bool, error) {
-	info, err := os.Stat(dir)
-	if err != nil || !info.IsDir() {
+	info, err := os.Lstat(dir)
+	if err != nil || info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+		return false, nil
+	}
+	if stat, ok := info.Sys().(*syscall.Stat_t); !ok || int(stat.Uid) != os.Getuid() {
 		return false, nil
 	}
 	f, err := os.OpenFile(filepath.Join(dir, "core.lock"), os.O_CREATE|os.O_RDWR, 0600)
@@ -356,53 +388,14 @@ func runtimeUid() int {
 	return os.Getuid()
 }
 
-const activeMarkerPath = "/run/whoisthat/active"
-
-// checkActiveUser blocks a second uid from reconciling the rules of the active
-// core. Best effort: without a root-created marker nothing is enforced.
-func checkActiveUser(uid int) error {
-	data, err := os.ReadFile(activeMarkerPath)
-	if err != nil {
-		return nil
-	}
-	owner := strings.TrimSpace(string(data))
-	if owner == "" || owner == strconv.Itoa(uid) {
-		return nil
-	}
-	return fmt.Errorf("another user (uid %s) owns whoisthat-core/tun; stop it before starting this one", owner)
-}
-
-// claimActiveUser is best effort: /run/whoisthat is root-owned, so a normal
-// user can only update the marker when the helper made it writable.
-// shortcut: the marker is only enforced when a root helper pre-creates it;
-// upgrade by having install-init write it once multi-user sessions matter.
-func claimActiveUser(uid int) {
-	err := os.WriteFile(activeMarkerPath, []byte(strconv.Itoa(uid)+"\n"), 0644)
-	if err != nil && !errors.Is(err, os.ErrNotExist) && !errors.Is(err, syscall.EACCES) {
-		logger.Warnf("active-core marker: %v", err)
-	}
-}
-
-func releaseActiveUser() {
-	data, err := os.ReadFile(activeMarkerPath)
-	if err != nil {
-		return
-	}
-	if strings.TrimSpace(string(data)) != strconv.Itoa(runtimeUid()) {
-		return
-	}
-	if err := os.Remove(activeMarkerPath); err != nil && !errors.Is(err, os.ErrNotExist) {
-		logger.Warnf("active-core marker cleanup: %v", err)
-	}
-}
-
-// coreAlreadyRunning reports whether another whoisthat-core is already
 // coreLogPath returns the first writable location. A read-only config
 // directory (which exists, so MkdirAll succeeds) must not silently swallow the
 // log: probe the actual file and fall back to a per-user temp directory.
 func coreLogPath(configDir string) string {
-	candidate := filepath.Join(configDir, "core.log")
-	if err := os.MkdirAll(configDir, 0700); err == nil {
+	if err := utils.EnsurePrivateDir(configDir, os.Getuid()); err != nil {
+		fmt.Fprintln(os.Stderr, "whoisthat-core: refusing to use the config directory for logs:", err)
+	} else {
+		candidate := filepath.Join(configDir, "core.log")
 		probe, err := os.OpenFile(candidate, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
 		if err == nil {
 			_ = probe.Close()
@@ -410,9 +403,11 @@ func coreLogPath(configDir string) string {
 		}
 	}
 
-	fallbackDir := filepath.Join(os.TempDir(), fmt.Sprintf("whoisthat-%d", utils.RealUserUid()))
-	_ = os.MkdirAll(fallbackDir, 0700)
-	utils.EnsurePerms(fallbackDir, 0700)
+	fallbackDir := filepath.Join(os.TempDir(), fmt.Sprintf("whoisthat-%d", os.Getuid()))
+	if err := utils.EnsurePrivateDir(fallbackDir, os.Getuid()); err != nil {
+		fmt.Fprintln(os.Stderr, "whoisthat-core: refusing to use the fallback log directory:", err)
+		return ""
+	}
 	return filepath.Join(fallbackDir, "core.log")
 }
 
@@ -421,7 +416,7 @@ func coreLogPath(configDir string) string {
 // crash leaves no trace anywhere.
 func setupCrashLog() {
 	dataDir := utils.DataDir()
-	if err := os.MkdirAll(dataDir, 0700); err != nil {
+	if err := utils.EnsurePrivateDir(dataDir, os.Getuid()); err != nil {
 		return
 	}
 	path := filepath.Join(dataDir, "core-crash.log")
@@ -503,9 +498,9 @@ func bootAutoconnect(database *db.DB, proxy_manager *proxy.ProxyManager, tun_man
 	}
 
 	if !utils.CanTun() {
-		logger.Warn("boot-autoconnect: TUN mode was requested but the core binary lacks network capabilities.")
-		logger.Warn("boot-autoconnect: this usually happens after rebuilding the core binary (inode changes, caps lost).")
-		logger.Warnf("boot-autoconnect: fix: sudo setcap cap_net_admin,cap_net_raw,cap_setpcap=+ep %s", os.Args[0])
+		logger.Warn("boot-autoconnect: TUN mode was requested but this core cannot manage the network.")
+		logger.Warn("boot-autoconnect: this usually means capabilities were lost after a rebuild, or the user is not authorized.")
+		logger.Warnf("boot-autoconnect: fix: sudo /usr/lib/whoisthat/authorize-core --add %d", utils.RealUserUid())
 		return
 	}
 
