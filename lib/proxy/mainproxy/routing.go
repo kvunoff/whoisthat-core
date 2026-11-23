@@ -304,10 +304,6 @@ func (p *ProxyManager) reloadCoreLocked(tunName string) error {
 
 	var xray_config []byte
 	var selection structs.RoutingSelection
-	statsTags := p.statsTags
-	if len(statsTags) == 0 {
-		statsTags = []string{"proxy"}
-	}
 
 	if profile.Managed && p.DB != nil {
 		manual, _, _ := p.DB.LoadEffectiveManualRouting(profile.GroupId)
@@ -318,14 +314,11 @@ func (p *ProxyManager) reloadCoreLocked(tunName string) error {
 			GeoDir:         geoDir,
 			BootstrapHosts: p.bootstrapHosts,
 		}
-		cfg, tags, err := p.prepareManagedConfig(profile, app_config.SocksPort, app_config.HttpPort, tunArg, apiPort, geoDir, manual, p.bootstrapHosts)
+		cfg, _, err := p.prepareManagedConfig(profile, app_config.SocksPort, app_config.HttpPort, tunArg, apiPort, geoDir, manual, p.bootstrapHosts)
 		if err != nil {
 			return fmt.Errorf("failed to build provider JSON config: %w", err)
 		}
 		xray_config = cfg
-		if len(tags) > 0 {
-			statsTags = tags
-		}
 		logger.Infof("routing: reload provider JSON (%d outbounds, %d manual rules, source=manual)",
 			countOutbounds(xray_config), len(manual.Rules))
 	} else {
@@ -385,8 +378,10 @@ func (p *ProxyManager) reloadCoreLocked(tunName string) error {
 		}
 	}
 
-	// Retire the active exit-watcher so it doesn't fire on intentional Stop()
+	// Retire the active exit-watcher so it doesn't fire on intentional Stop().
+	// Stop the sampler first so its gRPC client is closed before Xray exits.
 	p.retireExitWatcher()
+	p.stopMeter()
 
 	p.core.Stop()
 	time.Sleep(30 * time.Millisecond)
@@ -406,15 +401,9 @@ func (p *ProxyManager) reloadCoreLocked(tunName string) error {
 
 	p.core = newCore
 
-	// Restart stats collector with the new core instance
-	if p.statsCancel != nil {
-		close(p.statsCancel)
-		p.statsCancel = nil
-	}
-	p.statsCancel = make(chan struct{})
+	// Restart the traffic sampler for the new core generation.
 	p.statsApiPort = apiPort
-	p.statsTags = statsTags
-	go p.collectStats(app_config.SocksPort, p.statsApiPort, statsTags, tunName, p.statsCancel, p.StatsChanged)
+	p.startMeter(p.newTrafficSource(apiPort, xray_config, p.tunEnabled))
 
 	p.startExitWatcher()
 
