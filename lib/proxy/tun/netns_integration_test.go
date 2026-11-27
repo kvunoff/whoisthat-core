@@ -49,7 +49,7 @@ func TestNetnsTunLifecycleAndReconcile(t *testing.T) {
 	t.Setenv("XDG_RUNTIME_DIR", t.TempDir())
 
 	const tun = "wittest0"
-	if err := createTun(tun, "198.18.0.1", "fd00::1"); err != nil {
+	if err := createTun(tun, "198.18.0.1", "fd00::1", DefaultTunMTU); err != nil {
 		t.Skipf("cannot create TUN device in test namespace: %v", err)
 	}
 	if _, err := runScriptWithSh("ip link show " + tun); err != nil {
@@ -111,7 +111,7 @@ func TestNetnsRpFilterRestored(t *testing.T) {
 	t.Setenv("XDG_RUNTIME_DIR", t.TempDir())
 
 	const tun = "wittest0"
-	if err := createTun(tun, "198.18.0.1", ""); err != nil {
+	if err := createTun(tun, "198.18.0.1", "", DefaultTunMTU); err != nil {
 		t.Skipf("cannot create TUN device: %v", err)
 	}
 	defer func() { _, _ = runScriptWithSh("ip link del dev " + tun + " 2>/dev/null || true") }()
@@ -340,5 +340,26 @@ func TestNetnsBypassAccountingRules(t *testing.T) {
 	}
 	if up != 0 || down != 0 {
 		t.Errorf("fresh counters = %d/%d, want 0/0", up, down)
+	}
+}
+
+// TestNetnsTunMTU verifies under real root that the configured MTU reaches the
+// kernel interface, not only the generated Xray JSON.
+func TestNetnsTunMTU(t *testing.T) {
+	enterTestNetns(t)
+
+	const tun = "wittestmtu"
+	const wantMTU = 1280
+	if err := createTun(tun, "198.18.0.1", "", wantMTU); err != nil {
+		t.Skipf("cannot create TUN device in test namespace: %v", err)
+	}
+	defer func() { _, _ = runScriptWithSh("ip link del dev " + tun + " 2>/dev/null || true") }()
+
+	out, err := runScriptWithSh("ip link show " + tun)
+	if err != nil {
+		t.Fatalf("TUN device not visible: %v", err)
+	}
+	if !strings.Contains(out, "mtu 1280") {
+		t.Fatalf("TUN interface MTU is not %d: %s", wantMTU, out)
 	}
 }
