@@ -152,7 +152,7 @@ func main() {
 	// firewall/routing rules from a previous core that exited without cleaning
 	// up (hard quit, crash, power loss mid-TUN). Guarded on the IPC endpoint
 	// being free so we never nuke a live core's rules.
-	if !testMode() && !coreAlreadyRunning() {
+	if !testMode() && utils.HasNetAdmin() && !coreAlreadyRunning() {
 		if err := tunmode.ReconcileOrphanedRules(appconfig.GetConfig().TunName); err != nil {
 			logger.Warnf("startup reconcile: %v", err)
 		} else {
@@ -272,7 +272,9 @@ func main() {
 			// is enabled it must survive a stopped daemon. It is removed only
 			// by an explicit kill-switch=false or the startup reconcile.
 			proxy_manager.Stop()
-			tun_manager.Stop()
+			if err := tun_manager.StopIfActive(); err != nil {
+				logger.Warn("shutdown TUN cleanup:", err)
+			}
 			os.Remove(appconfig.SocketPath())
 			server.Broadcast(lib.CreateJsonNotification("warn", structs.Warning{Key: "died", Content: reason}))
 			close(done)

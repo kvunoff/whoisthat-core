@@ -1,36 +1,30 @@
 # whoisthat-core
 
-Go daemon that powers [WhoisThat](https://github.com/kvunoff/whoisthat): Xray-core
-runtime, TUN mode, kill-switch, subscriptions, encrypted profile storage and the
-JSON IPC protocol used by the Rust TUI/CLI.
+`whoisthat-core` provides Xray, profiles, subscriptions, routing, TUN, and
+kill-switch management through a length-prefixed JSON protocol. It runs
+independently of the WhoisThat TUI and CLI.
 
-> **Generated repository.** Every file except `README.md`, `.gitignore` and
-> `.github/` is mirrored automatically from
-> [`kvunoff/whoisthat`](https://github.com/kvunoff/whoisthat) (`core/core`).
-> Open issues and pull requests there. Commits here are made by
-> `github-actions[bot]` and carry a `Source-SHA:` trailer pointing at the
-> original commit.
+## Install and integrate
 
-## Build
+Download the appropriate daemon archive and verify its checksum using the
+[core releases](https://github.com/kvunoff/whoisthat/releases).
+Run `./whoisthat-core` as your ordinary user for local proxy mode. To install
+TUN support, use `sudo ./install-core --user "$USER" --tun` from the extracted
+archive. Add `--service` for service setup and `--split` to configure split
+tunneling with `whoisthat-run`.
 
-```bash
-go build -o whoisthat-core
-sudo setcap cap_net_admin,cap_net_raw,cap_setpcap=+ep whoisthat-core
-```
+See [Build & Run](https://docs.tuqise.com/developers/build) for the integration
+sequence and [IPC & Wire Protocol](https://docs.tuqise.com/reference/protocol)
+for commands and connection details.
 
-Requires Go 1.26+ (see `go.mod`). The daemon is normally started by the TUI, not
-by hand; see the [main repository](https://github.com/kvunoff/whoisthat) for
-installation and usage.
+## Build and test
 
-## Test
+Install the Go version declared in `go.mod`, then run:
 
-```bash
+```sh
+go build -o whoisthat-core .
 go test ./...
 ```
 
-TUN/firewall integration tests are gated behind the `integration` build tag and
-need root plus `/dev/net/tun`.
-
-## License
-
-MIT — see [LICENSE](LICENSE).
+The standalone source repository is a generated mirror. Report issues and
+submit changes to the [main WhoisThat repository](https://github.com/kvunoff/whoisthat).
